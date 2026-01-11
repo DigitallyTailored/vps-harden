@@ -22,6 +22,7 @@ Or clone the repository:
 ```bash
 git clone https://github.com/DigitallyTailored/vps-harden.git
 cd vps-harden
+chmod +x harden.sh
 sudo ./harden.sh
 ```
 

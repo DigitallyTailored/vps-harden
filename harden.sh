@@ -12,7 +12,7 @@ set -uo pipefail
 readonly DEFAULT_SSH_PORT=22222
 readonly LOGFILE='/var/log/server_hardening.log'
 readonly SSHDFILE='/etc/ssh/sshd_config'
-readonly SCRIPT_VERSION="1.0.0"
+readonly SCRIPT_VERSION="1.0.1"
 readonly MIN_UBUNTU_VERSION="20.04"
 
 #===============================================================================
@@ -38,6 +38,7 @@ UNAME=""
 BTIME=""
 START_TIME=""
 ERRORS_OCCURRED=0
+CURRENT_USER=""
 
 #===============================================================================
 # UTILITY FUNCTIONS
@@ -107,41 +108,23 @@ confirm() {
     [[ "${response,,}" == "y" ]]
 }
 
-spinner() {
-    local pid=$1
-    local delay=0.1
-    local spinstr='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
-    while ps -p "$pid" > /dev/null 2>&1; do
-        for ((i=0; i<${#spinstr}; i++)); do
-            echo -ne "\r  ${CYAN}${spinstr:$i:1}${NC} $2"
-            sleep "$delay"
-        done
-    done
-    echo -ne "\r\033[K"
-}
-
-run_with_spinner() {
-    local message="$1"
-    shift
-    local cmd_output
-    local cmd_status
-    
-    "$@" >> "$LOGFILE" 2>&1 &
-    local pid=$!
-    spinner "$pid" "$message"
-    wait "$pid" || true
-    cmd_status=$?
-    return $cmd_status
-}
-
 format_duration() {
     local seconds=$1
     local minutes=$((seconds / 60))
     local remaining_seconds=$((seconds % 60))
-    if ((minutes > 0)); then
+    if [[ $minutes -gt 0 ]]; then
         echo "${minutes}m ${remaining_seconds}s"
     else
         echo "${seconds}s"
+    fi
+}
+
+get_current_user() {
+    # Get the user who invoked sudo, or current user if not using sudo
+    if [[ -n "${SUDO_USER:-}" ]]; then
+        CURRENT_USER="$SUDO_USER"
+    else
+        CURRENT_USER="$(whoami)"
     fi
 }
 
@@ -175,7 +158,7 @@ check_ubuntu_version() {
     local version_num="${VERSION_ID//./}"
     local min_version_num="${MIN_UBUNTU_VERSION//./}"
     
-    if ((version_num < min_version_num)); then
+    if [[ $version_num -lt $min_version_num ]]; then
         print_error "Ubuntu ${MIN_UBUNTU_VERSION}+ required (detected: ${VERSION_ID})"
         exit 1
     fi
@@ -241,6 +224,7 @@ show_pre_flight_check() {
     print_header "Pre-Flight Checks"
     
     check_root
+    get_current_user
     check_ubuntu_version
     check_network
     check_ssh_keys
@@ -358,7 +342,6 @@ install_packages() {
         ncdu
         
         # Required for MOTD
-        figlet
         lsb-release
         update-motd
     )
@@ -667,62 +650,212 @@ install_motd() {
     # Disable default MOTD components
     chmod -x /etc/update-motd.d/* 2>/dev/null || true
     
-    # Create custom MOTD header
+    # Create system info MOTD
     cat > /etc/update-motd.d/00-header << 'MOTDEOF'
 #!/bin/bash
-figlet -f small "$(hostname)" 2>/dev/null || echo "=== $(hostname) ==="
-echo ""
-MOTDEOF
-    
-    # Create system info MOTD
-    cat > /etc/update-motd.d/10-sysinfo << 'MOTDEOF'
-#!/bin/bash
+#===============================================================================
+# System Status Report
+#===============================================================================
 
-CYAN='\033[0;36m'
+# Colors
+RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
-RED='\033[0;31m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
 DIM='\033[2m'
+BOLD='\033[1m'
 NC='\033[0m'
 
 # Source OS info
 . /etc/os-release 2>/dev/null || true
 
-# System info
-LOAD=$(cut -d' ' -f1 /proc/loadavg)
-MEMORY=$(free -m | awk 'NR==2{printf "%.1f%%", $3*100/$2}')
-DISK=$(df -h / | awk 'NR==2{print $5}')
-UPTIME=$(uptime -p 2>/dev/null | sed 's/up //' || echo "unknown")
-IP=$(hostname -I 2>/dev/null | awk '{print $1}' || echo "unknown")
+#===============================================================================
+# SYSTEM OVERVIEW
+#===============================================================================
+echo -e "\n${CYAN}${BOLD}══════════════════════════════════════════════════════════════════${NC}"
+echo -e "${CYAN}${BOLD}  SYSTEM STATUS REPORT${NC}"
+echo -e "${CYAN}${BOLD}══════════════════════════════════════════════════════════════════${NC}"
 
-echo -e "${DIM}─────────────────────────────────────────────────────────${NC}"
-printf "${CYAN}%-15s${NC} %s\n" "OS:" "${PRETTY_NAME:-Ubuntu}"
-printf "${CYAN}%-15s${NC} %s\n" "Kernel:" "$(uname -r)"
-printf "${CYAN}%-15s${NC} %s\n" "Uptime:" "$UPTIME"
-printf "${CYAN}%-15s${NC} %s\n" "IP Address:" "$IP"
-echo -e "${DIM}─────────────────────────────────────────────────────────${NC}"
-printf "${CYAN}%-15s${NC} %s\n" "Load:" "$LOAD"
-printf "${CYAN}%-15s${NC} %s\n" "Memory:" "$MEMORY used"
-printf "${CYAN}%-15s${NC} %s\n" "Disk:" "$DISK used"
-echo -e "${DIM}─────────────────────────────────────────────────────────${NC}"
-echo ""
+# Basic system info
+HOSTNAME=$(hostname -f 2>/dev/null || hostname)
+KERNEL=$(uname -r)
+UPTIME=$(uptime -p 2>/dev/null | sed 's/up //' || echo "unknown")
+LOAD=$(cut -d' ' -f1-3 /proc/loadavg)
+IP_ADDR=$(hostname -I 2>/dev/null | awk '{print $1}' || echo "unknown")
+LAST_BOOT=$(who -b 2>/dev/null | awk '{print $3, $4}' || echo "unknown")
+
+echo -e "\n${BOLD}System${NC}"
+echo -e "${DIM}────────────────────────────────────────────────────────────────${NC}"
+printf "  ${CYAN}%-16s${NC} %s\n" "Hostname:" "$HOSTNAME"
+printf "  ${CYAN}%-16s${NC} %s\n" "OS:" "${PRETTY_NAME:-Ubuntu}"
+printf "  ${CYAN}%-16s${NC} %s\n" "Kernel:" "$KERNEL"
+printf "  ${CYAN}%-16s${NC} %s\n" "IP Address:" "$IP_ADDR"
+printf "  ${CYAN}%-16s${NC} %s\n" "Uptime:" "$UPTIME"
+printf "  ${CYAN}%-16s${NC} %s\n" "Last Boot:" "$LAST_BOOT"
+printf "  ${CYAN}%-16s${NC} %s\n" "Load Average:" "$LOAD"
+
+#===============================================================================
+# RESOURCE USAGE
+#===============================================================================
+MEMORY_USED=$(free -m | awk 'NR==2{printf "%.1f", $3*100/$2}')
+MEMORY_TOTAL=$(free -h | awk 'NR==2{print $2}')
+SWAP_USED=$(free -m | awk 'NR==3{if($2>0) printf "%.1f", $3*100/$2; else print "0"}')
+DISK_USED=$(df -h / | awk 'NR==2{print $5}' | tr -d '%')
+DISK_TOTAL=$(df -h / | awk 'NR==2{print $2}')
+
+echo -e "\n${BOLD}Resources${NC}"
+echo -e "${DIM}────────────────────────────────────────────────────────────────${NC}"
+
+# Memory bar
+if (( $(echo "$MEMORY_USED > 80" | bc -l 2>/dev/null || echo 0) )); then
+    MEM_COLOR=$RED
+elif (( $(echo "$MEMORY_USED > 60" | bc -l 2>/dev/null || echo 0) )); then
+    MEM_COLOR=$YELLOW
+else
+    MEM_COLOR=$GREEN
+fi
+printf "  ${CYAN}%-16s${NC} ${MEM_COLOR}%5.1f%%${NC} of %s\n" "Memory:" "$MEMORY_USED" "$MEMORY_TOTAL"
+
+# Swap
+printf "  ${CYAN}%-16s${NC} %5.1f%%\n" "Swap:" "$SWAP_USED"
+
+# Disk bar
+if [[ $DISK_USED -gt 80 ]]; then
+    DISK_COLOR=$RED
+elif [[ $DISK_USED -gt 60 ]]; then
+    DISK_COLOR=$YELLOW
+else
+    DISK_COLOR=$GREEN
+fi
+printf "  ${CYAN}%-16s${NC} ${DISK_COLOR}%5d%%${NC} of %s\n" "Disk (/):" "$DISK_USED" "$DISK_TOTAL"
+
+#===============================================================================
+# SECURITY STATUS
+#===============================================================================
+echo -e "\n${BOLD}Security${NC}"
+echo -e "${DIM}────────────────────────────────────────────────────────────────${NC}"
+
+# Users and groups
+TOTAL_USERS=$(cat /etc/passwd | wc -l)
+HUMAN_USERS=$(awk -F: '$3 >= 1000 && $3 < 65534 {print $1}' /etc/passwd | wc -l)
+SUDO_USERS=$(getent group sudo 2>/dev/null | cut -d: -f4 | tr ',' '\n' | grep -c . || echo "0")
+ROOT_USERS=$(awk -F: '$3 == 0 {print $1}' /etc/passwd | wc -l)
+
+printf "  ${CYAN}%-16s${NC} %d total, %d human, ${YELLOW}%d sudo${NC}, ${RED}%d root${NC}\n" "Users:" "$TOTAL_USERS" "$HUMAN_USERS" "$SUDO_USERS" "$ROOT_USERS"
+
+# Failed login attempts (last 24h)
+FAILED_LOGINS=$(grep "Failed password" /var/log/auth.log 2>/dev/null | grep "$(date +%b\ %d)" | wc -l || echo "0")
+if [[ $FAILED_LOGINS -gt 10 ]]; then
+    FAILED_COLOR=$RED
+elif [[ $FAILED_LOGINS -gt 0 ]]; then
+    FAILED_COLOR=$YELLOW
+else
+    FAILED_COLOR=$GREEN
+fi
+printf "  ${CYAN}%-16s${NC} ${FAILED_COLOR}%d${NC} (last 24h)\n" "Failed Logins:" "$FAILED_LOGINS"
+
+# Currently logged in users
+LOGGED_IN=$(who | wc -l)
+printf "  ${CYAN}%-16s${NC} %d\n" "Logged In:" "$LOGGED_IN"
+
+# Fail2ban status
+if command -v fail2ban-client &>/dev/null && systemctl is-active --quiet fail2ban; then
+    BANNED_IPS=$(fail2ban-client status sshd 2>/dev/null | grep "Currently banned" | awk '{print $NF}' || echo "0")
+    printf "  ${CYAN}%-16s${NC} ${GREEN}Active${NC}, %s IPs banned\n" "Fail2ban:" "$BANNED_IPS"
+else
+    printf "  ${CYAN}%-16s${NC} ${RED}Inactive${NC}\n" "Fail2ban:"
+fi
+
+# Firewall status
+if command -v ufw &>/dev/null; then
+    UFW_STATUS=$(ufw status 2>/dev/null | head -1 | awk '{print $2}')
+    if [[ "$UFW_STATUS" == "active" ]]; then
+        printf "  ${CYAN}%-16s${NC} ${GREEN}Active${NC}\n" "Firewall:"
+    else
+        printf "  ${CYAN}%-16s${NC} ${RED}Inactive${NC}\n" "Firewall:"
+    fi
+fi
+
+#===============================================================================
+# NETWORK - LISTENING PORTS
+#===============================================================================
+echo -e "\n${BOLD}Listening Ports${NC}"
+echo -e "${DIM}────────────────────────────────────────────────────────────────${NC}"
+
+# Get listening ports with services
+ss -tlnp 2>/dev/null | awk 'NR>1 {
+    split($4, a, ":");
+    port = a[length(a)];
+    proc = $6;
+    gsub(/.*"/, "", proc);
+    gsub(/".*/, "", proc);
+    if (port != "" && port ~ /^[0-9]+$/) {
+        printf "  %-8s %s\n", port, proc
+    }
+}' | sort -t' ' -k1 -n | uniq | head -10
+
+#===============================================================================
+# TOP PROCESSES
+#===============================================================================
+echo -e "\n${BOLD}Top Processes (by CPU)${NC}"
+echo -e "${DIM}────────────────────────────────────────────────────────────────${NC}"
+printf "  ${DIM}%-6s %-10s %-6s %-6s %s${NC}\n" "PID" "USER" "CPU%" "MEM%" "COMMAND"
+ps aux --sort=-%cpu 2>/dev/null | awk 'NR>1 && NR<=6 {printf "  %-6s %-10s %-6s %-6s %s\n", $2, $1, $3, $4, $11}' | head -5
+
+#===============================================================================
+# RECENT LOGINS
+#===============================================================================
+echo -e "\n${BOLD}Recent Logins${NC}"
+echo -e "${DIM}────────────────────────────────────────────────────────────────${NC}"
+last -n 5 -a 2>/dev/null | head -5 | while read line; do
+    if [[ -n "$line" ]] && [[ ! "$line" =~ ^$ ]] && [[ ! "$line" =~ ^wtmp ]]; then
+        echo "  $line"
+    fi
+done
+
+#===============================================================================
+# UPDATES
+#===============================================================================
+echo -e "\n${BOLD}Updates${NC}"
+echo -e "${DIM}────────────────────────────────────────────────────────────────${NC}"
+if [[ -f /var/lib/update-notifier/updates-available ]]; then
+    UPDATES=$(grep -oP '^\d+(?= updates)' /var/lib/update-notifier/updates-available 2>/dev/null || echo "0")
+    SECURITY=$(grep -oP '^\d+(?= .* security)' /var/lib/update-notifier/updates-available 2>/dev/null || echo "0")
+else
+    UPDATES=$(apt-get -s upgrade 2>/dev/null | grep -P '^\d+ upgraded' | cut -d" " -f1 || echo "?")
+    SECURITY="?"
+fi
+
+if [[ "$UPDATES" != "0" ]] && [[ "$UPDATES" != "?" ]]; then
+    printf "  ${CYAN}%-16s${NC} ${YELLOW}%s available${NC}\n" "Packages:" "$UPDATES"
+else
+    printf "  ${CYAN}%-16s${NC} ${GREEN}System up to date${NC}\n" "Packages:"
+fi
+
+if [[ "$SECURITY" != "0" ]] && [[ "$SECURITY" != "?" ]]; then
+    printf "  ${CYAN}%-16s${NC} ${RED}%s security updates!${NC}\n" "Security:" "$SECURITY"
+fi
+
+# Last update check
+if [[ -f /var/lib/apt/periodic/update-success-stamp ]]; then
+    LAST_UPDATE=$(stat -c %Y /var/lib/apt/periodic/update-success-stamp 2>/dev/null)
+    NOW=$(date +%s)
+    DAYS_AGO=$(( (NOW - LAST_UPDATE) / 86400 ))
+    printf "  ${CYAN}%-16s${NC} %d days ago\n" "Last Check:" "$DAYS_AGO"
+fi
+
+#===============================================================================
+# FOOTER
+#===============================================================================
+echo -e "\n${DIM}────────────────────────────────────────────────────────────────${NC}"
+echo -e "${RED}${BOLD}  ⚠  UNAUTHORIZED ACCESS IS PROHIBITED${NC}"
+echo -e "${DIM}  All activity on this system may be monitored and recorded.${NC}"
+echo -e "${DIM}────────────────────────────────────────────────────────────────${NC}\n"
 MOTDEOF
     
-    # Create footer
-    cat > /etc/update-motd.d/90-footer << 'MOTDEOF'
-#!/bin/bash
-RED='\033[0;31m'
-DIM='\033[2m'
-NC='\033[0m'
-echo -e "${RED}UNAUTHORIZED ACCESS PROHIBITED${NC}"
-echo -e "${DIM}All activity may be monitored and recorded.${NC}"
-echo ""
-MOTDEOF
-    
-    # Make scripts executable
+    # Make script executable
     chmod +x /etc/update-motd.d/00-header
-    chmod +x /etc/update-motd.d/10-sysinfo
-    chmod +x /etc/update-motd.d/90-footer
     
     # Update issue.net for pre-login banner
     cat > /etc/issue.net << 'EOF'
@@ -744,11 +877,16 @@ EOF
 restart_ssh_service() {
     print_step "Restarting SSH Service"
     
+    # Determine which user to show in the connection command
+    local ssh_user="${UNAME:-$CURRENT_USER}"
+    local server_ip
+    server_ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+    
     echo ""
     echo -e "  ${YELLOW}${BOLD}⚠  IMPORTANT: Keep this terminal open!${NC}"
     echo -e "  ${YELLOW}Open a NEW terminal and test SSH access before closing this one.${NC}"
     echo ""
-    echo -e "  Test command: ${BOLD}ssh -p ${SSHPORT} ${UNAME:-root}@$(hostname -I | awk '{print $1}')${NC}"
+    echo -e "  Test command: ${BOLD}ssh -p ${SSHPORT} ${ssh_user}@${server_ip}${NC}"
     echo ""
     
     if ! confirm "Restart SSH and enable firewall now?" "y"; then
@@ -808,6 +946,11 @@ show_summary() {
     end_time=$(date +%s)
     local duration=$((end_time - START_TIME))
     
+    # Determine which user to show
+    local ssh_user="${UNAME:-$CURRENT_USER}"
+    local server_ip
+    server_ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+    
     clear
     print_header "Installation Complete"
     
@@ -822,7 +965,7 @@ show_summary() {
     echo -e "${CYAN}${BOLD}  Connection Details${NC}"
     echo -e "  ${DIM}────────────────────────────────────────────────${NC}"
     printf "  %-20s %s\n" "SSH Port:" "${BOLD}${SSHPORT}${NC}"
-    printf "  %-20s %s\n" "SSH User:" "${BOLD}${UNAME:-root}${NC}"
+    printf "  %-20s %s\n" "SSH User:" "${BOLD}${ssh_user}${NC}"
     printf "  %-20s %s\n" "Password Auth:" "${RED}Disabled${NC}"
     printf "  %-20s %s\n" "Root Login:" "Key only"
     
@@ -843,7 +986,7 @@ show_summary() {
     echo -e "${RED}${BOLD}  ⚠  TEST BEFORE CLOSING THIS SESSION${NC}"
     echo -e "  ${DIM}────────────────────────────────────────────────${NC}"
     echo -e "  1. Open a ${BOLD}new terminal window${NC}"
-    echo -e "  2. Run: ${BOLD}ssh -p ${SSHPORT} ${UNAME:-root}@$(hostname -I 2>/dev/null | awk '{print $1}')${NC}"
+    echo -e "  2. Run: ${BOLD}ssh -p ${SSHPORT} ${ssh_user}@${server_ip}${NC}"
     echo -e "  3. Confirm you can login successfully"
     echo -e "  4. ${GREEN}Only then${NC} close this session"
     
